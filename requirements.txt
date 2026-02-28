@@ -1,0 +1,6 @@
+fastmcp>=3.0
+pandas
+openpyxl
+matplotlib
+python-dotenv
+tabulate
