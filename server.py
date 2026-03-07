@@ -1,278 +1,633 @@
+"""
+DataClaw MCP v3.0 — JSON Architecture
+======================================
+PRINCÍPIO FUNDAMENTAL:
+  - Pandas calcula TUDO
+  - Server retorna JSON com números prontos e labels inequívocos
+  - LLM só formata e apresenta — NUNCA recalcula
+
+Por que isso resolve o problema de 20k linhas:
+  - O CSV nunca entra no contexto do LLM
+  - Apenas o JSON final (< 2KB) vai para o LLM
+  - Impossível reinterpretação: labels são autoexplicativos
+"""
+
+import sys
+import os
+import json
+import hashlib
+from pathlib import Path
+from datetime import datetime
+
 from fastmcp import FastMCP
 import pandas as pd
-import os
-from datetime import datetime
-import matplotlib
-matplotlib.use("Agg")  # ✅ sem display gráfico, roda headless
-import matplotlib.pyplot as plt
+import numpy as np
 
-mcp = FastMCP("DataClaw-Local", version="1.0.0")
+mcp = FastMCP("DataClaw", version="3.0.0")
 
-os.makedirs("outputs", exist_ok=True)
-os.makedirs("testes", exist_ok=True)
+_CACHE: dict[str, tuple] = {}
+_CACHE_LIMIT = 3
 
-
-# ─────────────────────────────────────────────
-# ✅ FIX 2: Limpeza numérica com regra dos 70%
-# Evita destruir colunas de texto como "Cliente_1234" ou "iPhone 15"
-# ─────────────────────────────────────────────
-def coerce_numeric_if_majority(series: pd.Series, threshold: float = 0.7) -> pd.Series:
-    converted = pd.to_numeric(
-        series.astype(str)
-            .str.replace(r"[^\d.,\-]", "", regex=True)
-            .str.replace(",", "."),
-        errors="coerce",
-    )
-    valid_ratio = converted.notna().sum() / max(len(series), 1)
-    return converted if valid_ratio >= threshold else series
+BASE_DIR   = Path(__file__).parent.resolve()
+OUTPUT_DIR = BASE_DIR / "outputs"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_csv_robust(file_path: str) -> pd.DataFrame:
-    """
-    Carrega CSV lidando com todos os problemas BR e sujos.
-    ✅ FIX: encoding fallback (utf-8 → latin-1 → cp1252)
-    ✅ FIX: separador fallback (; → auto-detect)
-    ✅ FIX: limpeza numérica segura (regra dos 70%)
-    """
-    file_path = os.path.expanduser(file_path)
-    if not os.path.exists(file_path):
-        raise FileNotFoundError(f"Arquivo não encontrado: {file_path}")
+# ─────────────────────────────────────────────────────────────────────────────
+# UTILITÁRIOS INTERNOS — pandas puro, zero LLM
+# ─────────────────────────────────────────────────────────────────────────────
 
-    df = None
+def _cache_key(path: str) -> str:
+    return hashlib.md5(path.encode()).hexdigest()[:8]
 
-    # ✅ FIX 5b: Tenta encodings em sequência
+
+def _detect_format(file_path: str) -> tuple:
+    """Detecta separador, decimal e encoding lendo apenas 4KB."""
     for enc in ["utf-8", "latin-1", "cp1252"]:
         try:
-            df = pd.read_csv(
-                file_path,
-                sep=";",
-                decimal=",",
-                encoding=enc,
-                on_bad_lines="skip",
-            )
-            break
-        except (UnicodeDecodeError, Exception):
+            with open(file_path, "r", encoding=enc, errors="strict") as f:
+                sample = f.read(4096)
+            counts = {s: sample.count(s) for s in [";", ",", "\t"]}
+            sep     = max(counts, key=counts.get)
+            decimal = "," if sep == ";" else "."
+            return sep, decimal, enc
+        except Exception:
             continue
-
-    # Fallback: detecção automática de separador
-    if df is None:
-        try:
-            df = pd.read_csv(
-                file_path,
-                sep=None,
-                decimal=".",
-                encoding="utf-8",
-                engine="python",
-                on_bad_lines="skip",
-            )
-        except Exception as e:
-            raise ValueError(f"Não foi possível ler o arquivo: {e}")
-
-    # Remove linhas completamente vazias e duplicatas
-    df = df.drop_duplicates().dropna(how="all")
-
-    # ✅ FIX 2: Aplica conversão numérica segura com threshold 70%
-    for col in df.select_dtypes(include="object").columns:
-        df[col] = coerce_numeric_if_majority(df[col])
-
-    return df
+    return ",", ".", "utf-8"
 
 
-def detectar_colunas(df: pd.DataFrame):
-    """Detecta automaticamente colunas de valor, data e categoria."""
-    value_col = next(
-        (c for c in df.columns if any(k in c.lower() for k in ["total", "valor", "receita", "faturamento", "preco", "price"])),
-        None,
+_PTBR = {
+    "zero":0,"um":1,"uma":1,"dois":2,"duas":2,"tres":3,"três":3,
+    "quatro":4,"cinco":5,"seis":6,"sete":7,"oito":8,"nove":9,
+    "dez":10,"onze":11,"doze":12,"treze":13,"catorze":14,
+    "quatorze":14,"quinze":15,"dezesseis":16,"dezessete":17,
+    "dezoito":18,"dezenove":19,"vinte":20
+}
+
+def _coerce_numeric(series: pd.Series, threshold: float = 0.75) -> pd.Series:
+    """Converte object→número com segurança. Resolve PT-BR ('dez'→10)."""
+    mapped = series.astype(str).str.strip().str.lower().map(
+        lambda x: str(_PTBR[x]) if x in _PTBR else x
     )
-    date_col = next(
-        (c for c in df.columns if any(k in c.lower() for k in ["data", "date", "dt_", "_dt", "periodo"])),
-        None,
+    cleaned = (
+        mapped
+        .str.replace(r"[^\d.,\-]", "", regex=True)
+        .str.replace(",", ".", regex=False)
     )
-    cat_col = next(
-        (c for c in df.columns if any(k in c.lower() for k in ["categoria", "produto", "vendedor", "status", "cidade"])),
-        None,
-    )
-    return value_col, date_col, cat_col
+    converted = pd.to_numeric(cleaned, errors="coerce")
+    ratio = converted.notna().sum() / max(len(series.dropna()), 1)
+    return converted if ratio >= threshold else series
 
 
-# ─────────────────────────────────────────────
-# TOOL 1: analyze_csv
-# ─────────────────────────────────────────────
-@mcp.tool
-def analyze_csv(
-    file_path: str,
-    pergunta: str = "Faça uma análise completa: totais, tendências, outliers e insights acionáveis",
-) -> str:
+def _normalize_text(series: pd.Series) -> pd.Series:
+    """Title case + strip em colunas categóricas."""
+    if series.dtype != object:
+        return series
+    return series.astype(str).str.strip().str.title()
+
+
+def _load(file_path: str) -> tuple:
     """
-    Analisa qualquer CSV grande e sujo com precisão matemática.
-    Detecta automaticamente colunas de valor, data e categoria.
+    Retorna (df_raw, df_clean).
+    df_raw:  original — para métricas brutas
+    df_clean: limpo e normalizado — para todas as análises
+    Usa cache para evitar releitura.
     """
-    try:
-        df = load_csv_robust(file_path)
-        value_col, date_col, cat_col = detectar_colunas(df)
+    key = _cache_key(file_path)
+    if key in _CACHE:
+        return _CACHE[key]
 
-        report = f"# 📊 DataClaw Analysis\n"
-        report += f"**Arquivo**: {os.path.basename(file_path)}\n"
-        report += f"**Data**: {datetime.now().strftime('%d/%m/%Y %H:%M')}\n"
-        report += f"**Linhas**: {len(df):,} | **Colunas**: {len(df.columns)}\n\n"
+    sep, decimal, enc = _detect_format(file_path)
 
-        # ✅ FIX 5: Resumo estatístico truncado — só numéricas, máximo 8 colunas
-        num_df = df.select_dtypes(include="number")
-        if not num_df.empty:
-            report += "## Resumo Estatístico\n"
-            cols_to_show = num_df.columns[:8].tolist()
-            report += num_df[cols_to_show].describe().round(2).to_markdown()
-            if len(num_df.columns) > 8:
-                report += f"\n*Exibindo {len(cols_to_show)} de {len(num_df.columns)} colunas numéricas.*\n"
-            report += "\n\n"
+    with open(file_path, "r", encoding=enc, errors="replace") as f:
+        total_lines = sum(1 for _ in f) - 1
 
-        # Faturamento total
-        if value_col:
-            total = df[value_col].sum()
-            media = df[value_col].mean()
-            maximo = df[value_col].max()
-            report += f"## 💰 Financeiro ({value_col})\n"
-            report += f"- **Total**: R$ {total:,.2f}\n"
-            report += f"- **Média por venda**: R$ {media:,.2f}\n"
-            report += f"- **Maior venda**: R$ {maximo:,.2f}\n\n"
+    kw = dict(sep=sep, decimal=decimal, encoding=enc,
+              on_bad_lines="skip", low_memory=False)
 
-        # Tendência mensal
-        if date_col and value_col:
-            df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
-            valid_dates = df[date_col].notna()
-            report += f"⚠️ Datas inválidas ignoradas: {(~valid_dates).sum():,} linhas\n\n"
-            if valid_dates.sum() > 0:
-                monthly = (
-                    df[valid_dates]
-                    .groupby(df[date_col].dt.to_period("M"))[value_col]
-                    .agg(["sum", "count"])
-                    .rename(columns={"sum": "Total R$", "count": "Qtd Vendas"})
-                    .tail(12)  # últimos 12 meses
-                )
-                report += "## 📅 Tendência Mensal (últimos 12 meses)\n"
-                report += monthly.to_markdown() + "\n\n"
+    if total_lines <= 50_000:
+        df_raw = pd.read_csv(file_path, **kw)
+    else:
+        chunks = [c for c in pd.read_csv(file_path, chunksize=5000, **kw)]
+        df_raw = pd.concat(chunks, ignore_index=True)
 
-        # Top categorias
-        if cat_col:
-            report += f"## 🏷️ Top 10 por {cat_col}\n"
-            if value_col:
-                top = df.groupby(cat_col)[value_col].sum().sort_values(ascending=False).head(10)
-                report += top.to_frame().to_markdown() + "\n\n"
-            else:
-                top = df[cat_col].value_counts().head(10)
-                report += top.to_frame().to_markdown() + "\n\n"
+    df_clean = df_raw.drop_duplicates().dropna(how="all").reset_index(drop=True)
 
-        # Outliers simples
-        if value_col:
-            q1 = df[value_col].quantile(0.25)
-            q3 = df[value_col].quantile(0.75)
-            iqr = q3 - q1
-            outliers = df[(df[value_col] < q1 - 1.5 * iqr) | (df[value_col] > q3 + 1.5 * iqr)]
-            report += f"## ⚠️ Outliers Detectados\n"
-            report += f"- {len(outliers):,} transações fora do padrão (método IQR)\n"
-            if len(outliers) > 0:
-                report += f"- Faixa normal: R$ {q1 - 1.5*iqr:,.2f} a R$ {q3 + 1.5*iqr:,.2f}\n\n"
+    # Converte numéricos (resolve "dez" → 10)
+    for col in df_clean.select_dtypes(include=["object","string"]).columns:
+        df_clean[col] = _coerce_numeric(df_clean[col])
 
-        # Pergunta customizada no relatório
-        report += f"## 🤖 Pergunta: {pergunta}\n"
-        report += "Análise acima responde com dados precisos. Solicite métricas específicas se necessário.\n\n"
+    # Normaliza categóricas (resolve "são paulo" → "São Paulo")
+    for col in df_clean.select_dtypes(include=["object","string"]).columns:
+        if df_clean[col].nunique() < 200:
+            df_clean[col] = _normalize_text(df_clean[col])
 
-        # ✅ FIX 3: Gráfico inteligente — detecta colunas corretas
-        # ✅ FIX 4: Salva arquivo + retorna caminho (não base64)
-        try:
-            plt.figure(figsize=(12, 5))
-
-            if date_col and value_col and valid_dates.sum() > 0:
-                monthly["Total R$"].plot(kind="bar", color="steelblue", edgecolor="white")
-                plt.title(f"Faturamento Mensal — {value_col}", fontsize=14)
-                plt.ylabel("R$")
-                plt.xlabel("Mês")
-            elif cat_col and value_col:
-                top.plot(kind="barh", color="steelblue", edgecolor="white")
-                plt.title(f"Top 10 {cat_col} por {value_col}", fontsize=14)
-                plt.xlabel("R$")
-            else:
-                num_df.mean().plot(kind="bar", color="steelblue", edgecolor="white")
-                plt.title("Médias das colunas numéricas", fontsize=14)
-
-            plt.tight_layout()
-            chart_name = f"chart_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            chart_path = os.path.abspath(f"outputs/{chart_name}")
-            plt.savefig(chart_path, dpi=100, bbox_inches="tight")
-            plt.close()
-            report += f"## 📈 Gráfico\nSalvo em: `{chart_path}`\n"
-        except Exception as chart_err:
-            report += f"⚠️ Gráfico não gerado: {chart_err}\n"
-
-        return report
-
-    except Exception as e:
-        return f"❌ Erro na análise: {str(e)}\nDica: verifique o caminho do arquivo e se é um CSV válido."
+    if len(_CACHE) >= _CACHE_LIMIT:
+        del _CACHE[next(iter(_CACHE))]
+    _CACHE[key] = (df_raw, df_clean)
+    return df_raw, df_clean
 
 
-# ─────────────────────────────────────────────
-# TOOL 2: clean_csv
-# ─────────────────────────────────────────────
-@mcp.tool
-def clean_csv(file_path: str, output_name: str = "cleaned.csv") -> str:
-    """
-    Limpa o CSV: remove duplicados, linhas vazias e padroniza encoding.
-    Retorna o caminho do arquivo limpo.
-    """
-    try:
-        df_raw = pd.read_csv(file_path, sep=";", decimal=",", encoding="utf-8", on_bad_lines="skip")
-        linhas_antes = len(df_raw)
-
-        df_clean = df_raw.drop_duplicates().dropna(how="all").reset_index(drop=True)
-        linhas_depois = len(df_clean)
-
-        output_path = os.path.abspath(f"outputs/{output_name}")
-        df_clean.to_csv(output_path, index=False, sep=";", decimal=",", encoding="utf-8")
-
-        return (
-            f"✅ CSV limpo salvo em: {output_path}\n"
-            f"   Linhas antes: {linhas_antes:,}\n"
-            f"   Linhas depois: {linhas_depois:,}\n"
-            f"   Removidas: {linhas_antes - linhas_depois:,} (duplicadas/vazias)"
-        )
-    except Exception as e:
-        return f"❌ Erro na limpeza: {str(e)}"
+def _find_col(df: pd.DataFrame, keywords: list[str],
+              dtype_filter: str = None) -> str | None:
+    """Encontra coluna por keywords no nome."""
+    num_cols = set(df.select_dtypes(include="number").columns)
+    for kw in keywords:
+        for col in df.columns:
+            if kw in col.lower():
+                if dtype_filter == "numeric" and col not in num_cols:
+                    continue
+                return col
+    return None
 
 
-# ─────────────────────────────────────────────
-# TOOL 3: csv_info  (nova — diagnóstico rápido)
-# ─────────────────────────────────────────────
+def _safe(val):
+    """Converte tipos numpy para Python nativo (para json.dumps)."""
+    if isinstance(val, (np.integer,)):  return int(val)
+    if isinstance(val, (np.floating,)): return round(float(val), 2)
+    if isinstance(val, (np.bool_,)):    return bool(val)
+    if pd.isna(val):                    return None
+    return val
+
+
+def _to_json(data: dict) -> str:
+    """Serializa dict para JSON com indentação. Limite de 3500 chars."""
+    raw = json.dumps(data, ensure_ascii=False, indent=2, default=_safe)
+    if len(raw) > 3500:
+        # Trunca listas longas antes de serializar novamente
+        for k, v in data.items():
+            if isinstance(v, list) and len(v) > 8:
+                data[k] = v[:8]
+                data[f"{k}_truncated"] = True
+        raw = json.dumps(data, ensure_ascii=False, indent=2, default=_safe)
+    return raw
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL 1 — csv_info
+# Diagnóstico de estrutura. Não calcula métricas de negócio.
+# ─────────────────────────────────────────────────────────────────────────────
 @mcp.tool
 def csv_info(file_path: str) -> str:
     """
-    Diagnóstico rápido do CSV: colunas, tipos, % de nulos, encoding.
-    Útil para entender a estrutura antes de analisar.
+    Diagnóstico da estrutura do CSV: colunas, tipos, nulos e tamanho.
+    Retorna JSON. Chame ANTES de analyze_csv.
+
+    Args:
+        file_path: Caminho absoluto do arquivo CSV.
     """
     try:
         file_path = os.path.expanduser(file_path)
-        # lê só 1000 linhas para diagnóstico rápido
-        df = pd.read_csv(file_path, sep=";", decimal=",", encoding="utf-8",
-                         nrows=1000, on_bad_lines="skip")
+        if not os.path.exists(file_path):
+            return _to_json({"error": f"Arquivo não encontrado: {file_path}"})
 
-        info = f"# 🔍 Diagnóstico: {os.path.basename(file_path)}\n\n"
-        info += f"**Linhas amostradas**: 1.000 | **Colunas**: {len(df.columns)}\n\n"
-        info += "| Coluna | Tipo | % Nulos | Exemplo |\n"
-        info += "|--------|------|---------|--------|\n"
+        size_mb = round(os.path.getsize(file_path) / (1024 * 1024), 2)
+        sep, decimal, enc = _detect_format(file_path)
+
+        df = pd.read_csv(file_path, sep=sep, decimal=decimal,
+                         encoding=enc, nrows=2000, on_bad_lines="skip")
+
+        with open(file_path, "r", encoding=enc, errors="replace") as f:
+            total_lines = sum(1 for _ in f) - 1
+
+        columns = []
         for col in df.columns:
-            tipo = str(df[col].dtype)
-            pct_nulo = round(df[col].isna().sum() / len(df) * 100, 1)
-            exemplo = str(df[col].dropna().iloc[0]) if df[col].notna().any() else "—"
-            info += f"| {col} | {tipo} | {pct_nulo}% | {exemplo[:30]} |\n"
+            columns.append({
+                "name":         col,
+                "type":         str(df[col].dtype),
+                "null_pct":     round(df[col].isna().sum() / len(df) * 100, 1),
+                "unique_count": int(df[col].nunique()),
+                "sample_value": str(df[col].dropna().iloc[0])[:40] if df[col].notna().any() else None
+            })
 
-        return info
+        return _to_json({
+            "file_name":        Path(file_path).name,
+            "total_rows":       total_lines,
+            "total_columns":    len(df.columns),
+            "file_size_mb":     size_mb,
+            "separator":        sep,
+            "decimal":          decimal,
+            "encoding":         enc,
+            "columns":          columns
+        })
+
     except Exception as e:
-        return f"❌ Erro no diagnóstico: {str(e)}"
+        return _to_json({"error": str(e)})
 
 
-# ─────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL 2 — analyze_csv
+# Análise completa. Pandas calcula TUDO. LLM recebe JSON com números prontos.
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool
+def analyze_csv(
+    file_path: str,
+    focus: str = "full"
+) -> str:
+    """
+    Análise completa de CSV grande (10k–500k linhas).
+    Pandas processa tudo localmente. LLM recebe apenas JSON com números calculados.
+    Nunca envia dados brutos para o contexto.
+
+    Args:
+        file_path: Caminho absoluto do arquivo CSV.
+        focus: "full" | "financial" | "quality" | "trends" | "ranking"
+    """
+    try:
+        df_raw, df = _load(file_path)
+
+        value_col = _find_col(df, ["total_venda","total","receita","faturamento",
+                                   "revenue","amount","valor","price"], "numeric")
+        date_col  = _find_col(df, ["data","date","dt_","periodo","timestamp","created"])
+        cat_col   = _find_col(df, ["produto","product","vendedor","seller",
+                                   "categoria","category","cidade","city"])
+        status_col = _find_col(df, ["status","situacao","estado_venda"])
+
+        dups   = len(df_raw) - len(df)
+        result = {
+            "file_name":  Path(file_path).name,
+            "analyzed_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        }
+
+        # ── BLOCO: qualidade ─────────────────────────────────────────────────
+        null_cells  = int(df.isna().sum().sum())
+        total_cells = df.shape[0] * df.shape[1]
+
+        result["data_quality"] = {
+            "rows_in_file":               len(df_raw),
+            "rows_after_dedup":           len(df),
+            "duplicate_rows_removed":     dups,
+            "null_cells":                 null_cells,
+            "total_cells":                total_cells,
+            "null_pct":                   round(null_cells / total_cells * 100, 2),
+        }
+
+        # ── BLOCO: financeiro ────────────────────────────────────────────────
+        if value_col and focus in ["full", "financial"]:
+            t_bruto = float(df_raw[value_col].sum())
+            t_limpo = float(df[value_col].sum())
+            media   = float(df[value_col].mean())
+            maximo  = float(df[value_col].max())
+            minimo  = float(df[value_col].min())
+            nulos   = int(df[value_col].isna().sum())
+
+            result["financial"] = {
+                "value_column":                      value_col,
+                "total_WITH_duplicates":             round(t_bruto, 2),
+                "total_WITHOUT_duplicates":          round(t_limpo, 2),
+                "difference_caused_by_duplicates":   round(t_bruto - t_limpo, 2),
+                "average_per_row":                   round(media, 2),
+                "maximum_value":                     round(maximo, 2),
+                "minimum_value":                     round(minimo, 2),
+                "null_values_ignored":               nulos,
+                "CORRECT_VALUE_TO_USE":              round(t_limpo, 2),
+                "WARNING": "Always use total_WITHOUT_duplicates for reporting"
+            }
+
+        # ── BLOCO: datas e tendência ─────────────────────────────────────────
+        if date_col and focus in ["full", "trends"]:
+            df[date_col] = pd.to_datetime(df[date_col], errors="coerce", dayfirst=True)
+            valid    = df[date_col].notna()
+            inv_n    = int((~valid).sum())
+            inv_pct  = round(inv_n / len(df) * 100, 2)
+
+            result["dates"] = {
+                "date_column":          date_col,
+                "invalid_dates_count":  inv_n,
+                "invalid_dates_pct":    inv_pct,
+                "valid_dates_count":    int(valid.sum()),
+                "WARNING": f"{inv_n} rows ({inv_pct}%) excluded from trend analysis"
+            }
+
+            if valid.sum() > 0 and value_col:
+                monthly = (
+                    df[valid]
+                    .groupby(df.loc[valid, date_col].dt.to_period("M"))[value_col]
+                    .agg(total="sum", count="count")
+                    .round(2)
+                    .tail(12)
+                )
+                trend = []
+                for period, row in monthly.iterrows():
+                    trend.append({
+                        "month":              str(period),
+                        "total_revenue":      round(float(row["total"]), 2),
+                        "transaction_count":  int(row["count"])
+                    })
+                result["monthly_trend"] = trend
+
+        # ── BLOCO: rankings ──────────────────────────────────────────────────
+        if cat_col and focus in ["full", "ranking"]:
+            if value_col:
+                top = (df.groupby(cat_col)[value_col]
+                         .sum()
+                         .sort_values(ascending=False)
+                         .head(8))
+                ranking = [
+                    {"rank": i+1, "name": str(k), "total_revenue": round(float(v), 2)}
+                    for i, (k, v) in enumerate(top.items())
+                ]
+            else:
+                top = df[cat_col].value_counts().head(8)
+                ranking = [
+                    {"rank": i+1, "name": str(k), "count": int(v)}
+                    for i, (k, v) in enumerate(top.items())
+                ]
+            result[f"ranking_by_{cat_col}"] = ranking
+
+        # ── BLOCO: outliers (IQR + Z-score duplo) ───────────────────────────
+        if value_col and focus in ["full", "financial"]:
+            col_data = df[value_col].dropna()
+
+            # IQR
+            q1, q3 = col_data.quantile([0.25, 0.75])
+            iqr    = q3 - q1
+            lo_iqr = float(q1 - 1.5 * iqr)
+            hi_iqr = float(q3 + 1.5 * iqr)
+            out_iqr = df[(df[value_col] < lo_iqr) | (df[value_col] > hi_iqr)]
+
+            # Z-score (detecta outliers extremos que IQR pode perder)
+            z_scores = (col_data - col_data.mean()) / col_data.std()
+            out_z    = df.loc[col_data.index[z_scores.abs() > 3]]
+
+            # Top 5 outliers mais extremos para inspeção
+            top_outliers = (
+                df.nlargest(5, value_col)[[value_col] + ([cat_col] if cat_col else [])]
+                .reset_index(drop=True)
+            )
+            extreme = [
+                {
+                    "rank": i+1,
+                    "value": round(float(row[value_col]), 2),
+                    "category": str(row[cat_col]) if cat_col and cat_col in row else None
+                }
+                for i, row in top_outliers.iterrows()
+            ]
+
+            result["outliers"] = {
+                "method_iqr": {
+                    "normal_range_min": round(lo_iqr, 2),
+                    "normal_range_max": round(hi_iqr, 2),
+                    "outliers_count":   len(out_iqr),
+                    "outliers_pct":     round(len(out_iqr) / len(df) * 100, 2)
+                },
+                "method_zscore": {
+                    "threshold":       "z > 3",
+                    "outliers_count":  len(out_z),
+                    "outliers_pct":    round(len(out_z) / len(df) * 100, 2)
+                },
+                "top_5_extreme_values": extreme
+            }
+
+        # ── BLOCO: anomalias por categoria (Carlos suspeito, etc) ────────────
+        if status_col and cat_col and focus in ["full", "ranking"]:
+            cancel_vals = ["cancelada", "cancelado", "cancelled", "canceled"]
+            df["_is_cancel"] = df[status_col].astype(str).str.lower().str.strip().isin(cancel_vals)
+
+            cancel_by_cat = df.groupby(cat_col)["_is_cancel"].agg(
+                total="count", cancellations="sum"
+            )
+            cancel_by_cat["cancel_rate_pct"] = (
+                cancel_by_cat["cancellations"] / cancel_by_cat["total"] * 100
+            ).round(2)
+
+            mean_rate = float(cancel_by_cat["cancel_rate_pct"].mean())
+            std_rate  = float(cancel_by_cat["cancel_rate_pct"].std())
+            threshold = mean_rate + 1.5 * std_rate
+
+            anomalies = []
+            for name, row in cancel_by_cat.iterrows():
+                rate = float(row["cancel_rate_pct"])
+                anomalies.append({
+                    "name":                str(name),
+                    "total_sales":         int(row["total"]),
+                    "cancellations":       int(row["cancellations"]),
+                    "cancel_rate_pct":     rate,
+                    "is_anomaly":          rate > threshold,
+                    "deviation_from_mean": round(rate - mean_rate, 2)
+                })
+
+            anomalies.sort(key=lambda x: x["cancel_rate_pct"], reverse=True)
+            df.drop(columns=["_is_cancel"], inplace=True)
+
+            result[f"cancellation_analysis_by_{cat_col}"] = {
+                "team_average_cancel_rate_pct": round(mean_rate, 2),
+                "anomaly_threshold_pct":        round(threshold, 2),
+                "details":                      anomalies
+            }
+
+        # ── BLOCO: qualidade de colunas específicas ──────────────────────────
+        nota_col = _find_col(df, ["nota","rating","score","avaliacao"])
+        if nota_col and focus in ["full", "quality"]:
+            invalid_high = int((df[nota_col] > 5.0).sum())
+            invalid_low  = int((df[nota_col] < 1.0).sum())
+            result["rating_quality"] = {
+                "column":              nota_col,
+                "expected_range":      "1.0 to 5.0",
+                "values_above_5":      invalid_high,
+                "values_below_1":      invalid_low,
+                "total_invalid":       invalid_high + invalid_low,
+                "is_clean":            (invalid_high + invalid_low) == 0
+            }
+
+        # ── BLOCO: sazonalidade por categoria ────────────────────────────────
+        if date_col and value_col and cat_col and focus in ["full", "trends"]:
+            if df[date_col].notna().sum() > 0:
+                valid_df = df[df[date_col].notna()].copy()
+
+                # Coeficiente de variação mensal por categoria
+                seasonal = []
+                for name, grp in valid_df.groupby(cat_col):
+                    monthly_rev = (
+                        grp.groupby(grp[date_col].dt.month)[value_col].sum()
+                    )
+                    if len(monthly_rev) < 3:
+                        continue
+                    cv   = float(monthly_rev.std() / monthly_rev.mean() * 100)
+                    peak = int(monthly_rev.idxmax())
+                    months = {1:"Jan",2:"Fev",3:"Mar",4:"Abr",5:"Mai",6:"Jun",
+                              7:"Jul",8:"Ago",9:"Set",10:"Out",11:"Nov",12:"Dez"}
+                    seasonal.append({
+                        "category":                str(name),
+                        "seasonality_cv_pct":      round(cv, 1),
+                        "peak_month":              months.get(peak, str(peak)),
+                        "peak_month_revenue":      round(float(monthly_rev.max()), 2),
+                        "average_monthly_revenue": round(float(monthly_rev.mean()), 2),
+                        "peak_vs_average_ratio":   round(float(monthly_rev.max() / monthly_rev.mean()), 2),
+                        "has_strong_seasonality":  cv > 20
+                    })
+
+                seasonal.sort(key=lambda x: x["seasonality_cv_pct"], reverse=True)
+                result["seasonality_by_category"] = seasonal
+
+        return _to_json(result)
+
+    except Exception as e:
+        return _to_json({"error": str(e), "tip": "Run csv_info() first to validate the file."})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL 3 — query_csv
+# Filtro + agrupamento ad-hoc. Retorna JSON.
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool
+def query_csv(
+    file_path: str,
+    group_by: str = "",
+    filter_col: str = "",
+    filter_val: str = "",
+    metric: str = "sum",
+    top_n: int = 10,
+) -> str:
+    """
+    Consulta ad-hoc: agrupa e filtra sem enviar dados ao LLM.
+    Retorna JSON com resultados calculados pelo pandas.
+
+    Args:
+        file_path:  Caminho absoluto do arquivo CSV.
+        group_by:   Coluna para agrupar. Ex: "Vendedor", "Produto"
+        filter_col: Coluna para filtrar. Ex: "Status"
+        filter_val: Valor do filtro (case-insensitive). Ex: "Cancelada"
+        metric:     "sum" | "count" | "mean" | "min" | "max"
+        top_n:      Máximo de resultados (máx 15)
+    """
+    try:
+        _, df = _load(file_path)
+        top_n = min(top_n, 15)
+
+        # Filtro
+        if filter_col and filter_val:
+            if filter_col not in df.columns:
+                return _to_json({
+                    "error": f"Column '{filter_col}' not found",
+                    "available_columns": list(df.columns)
+                })
+            mask = df[filter_col].astype(str).str.strip().str.lower() == filter_val.strip().lower()
+            df   = df[mask]
+            if df.empty:
+                return _to_json({
+                    "result": "no_rows_found",
+                    "filter": f"{filter_col} = '{filter_val}'"
+                })
+
+        # Agrupamento
+        rows_total = len(df)
+        if group_by:
+            if group_by not in df.columns:
+                return _to_json({
+                    "error": f"Column '{group_by}' not found",
+                    "available_columns": list(df.columns)
+                })
+            num_cols = df.select_dtypes(include="number").columns.tolist()
+            agg_func = metric if metric in ["sum","mean","count","min","max"] else "sum"
+
+            if not num_cols:
+                counts = df[group_by].value_counts().head(top_n)
+                rows   = [{"rank": i+1, "name": str(k), "count": int(v)}
+                          for i, (k, v) in enumerate(counts.items())]
+            else:
+                grouped = (
+                    df.groupby(group_by)[num_cols]
+                    .agg(agg_func)
+                    .round(2)
+                    .sort_values(num_cols[0], ascending=False)
+                    .head(top_n)
+                    .reset_index()
+                )
+                rows = []
+                for i, row in grouped.iterrows():
+                    entry = {"rank": i+1, "name": str(row[group_by])}
+                    for col in num_cols:
+                        entry[col] = _safe(row[col])
+                    rows.append(entry)
+        else:
+            rows = df.head(top_n).to_dict(orient="records")
+
+        return _to_json({
+            "file":          Path(file_path).name,
+            "filter":        f"{filter_col}='{filter_val}'" if filter_col else None,
+            "group_by":      group_by or None,
+            "metric":        metric,
+            "rows_matched":  rows_total,
+            "results":       rows
+        })
+
+    except Exception as e:
+        return _to_json({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# TOOL 4 — clean_csv
+# Limpa e salva. Retorna JSON com estatísticas. NUNCA retorna dados brutos.
+# ─────────────────────────────────────────────────────────────────────────────
+@mcp.tool
+def clean_csv(file_path: str, output_name: str = "") -> str:
+    """
+    Limpa o CSV: remove duplicatas, linhas vazias, normaliza texto categórico.
+    Salva em outputs/ e retorna JSON com estatísticas. Nunca retorna dados brutos.
+
+    Args:
+        file_path:   Caminho absoluto do arquivo CSV original.
+        output_name: Nome do arquivo de saída. Ex: vendas_limpo.csv
+    """
+    try:
+        file_path = os.path.expanduser(file_path)
+        sep, decimal, enc = _detect_format(file_path)
+
+        df_raw = pd.read_csv(file_path, sep=sep, decimal=decimal,
+                             encoding=enc, on_bad_lines="skip", low_memory=False)
+        n_raw  = len(df_raw)
+
+        df_clean = df_raw.drop_duplicates().dropna(how="all").reset_index(drop=True)
+
+        # Normaliza categóricas
+        for col in df_clean.select_dtypes(include=["object","string"]).columns:
+            if df_clean[col].nunique() < 200:
+                df_clean[col] = _normalize_text(df_clean[col])
+
+        n_clean = len(df_clean)
+
+        if not output_name:
+            output_name = f"{Path(file_path).stem}_clean.csv"
+
+        out_path = OUTPUT_DIR / output_name
+        df_clean.to_csv(out_path, index=False, sep=sep, decimal=decimal, encoding="utf-8")
+
+        # Impacto financeiro das linhas removidas
+        value_col = _find_col(df_raw, ["total_venda","total","receita","revenue",
+                                        "amount","valor"], "numeric")
+        financial_impact = None
+        if value_col:
+            t_raw   = float(df_raw[value_col].sum())
+            t_clean = float(df_clean[value_col].sum())
+            financial_impact = {
+                "total_before": round(t_raw, 2),
+                "total_after":  round(t_clean, 2),
+                "difference":   round(t_raw - t_clean, 2)
+            }
+
+        return _to_json({
+            "status":                "success",
+            "output_file":           str(out_path.absolute()),
+            "rows_before":           n_raw,
+            "rows_after":            n_clean,
+            "rows_removed":          n_raw - n_clean,
+            "text_normalized":       True,
+            "file_size_kb":          round(out_path.stat().st_size / 1024, 1),
+            "financial_impact":      financial_impact,
+            "next_step":             f"analyze_csv('{out_path.absolute()}')"
+        })
+
+    except Exception as e:
+        return _to_json({"error": str(e)})
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ENTRY POINT
+# ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("🚀 DataClaw MCP Local rodando em stdio...")
-    print("   Tools disponíveis: analyze_csv | clean_csv | csv_info")
+    sys.stderr.write("DataClaw MCP v3.0 — JSON Architecture\n")
+    sys.stderr.write(f"  BASE_DIR:   {BASE_DIR}\n")
+    sys.stderr.write(f"  OUTPUT_DIR: {OUTPUT_DIR}\n")
+    sys.stderr.flush()
     mcp.run(transport="stdio")

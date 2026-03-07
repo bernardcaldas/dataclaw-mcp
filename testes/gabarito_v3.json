@@ -1,0 +1,80 @@
+{
+  "arquivo": "testes/vendas_v3_desafio.csv",
+  "total_linhas_bruto": 20150,
+  "total_linhas_limpo": 20105,
+  "duplicatas_removidas": 45,
+  "faturamento_bruto": 734827865.47,
+  "faturamento_limpo": 733604635.18,
+  "diferenca_duplicatas": 1223230.29,
+  "datas_invalidas_count": 2135,
+  "datas_invalidas_pct": 10.62,
+  "top5_produtos": {
+    "Monitor LG": 165083439.54,
+    "iPhone 15": 160590470.09,
+    "Mouse Logitech": 141141103.57,
+    "Notebook Dell": 134919844.98,
+    "Teclado Mecânico": 131869777.0
+  },
+  "top5_vendedores": {
+    "Maria": 171715064.46,
+    "Pedro": 145267593.45,
+    "Carlos": 140527551.05,
+    "João": 139588518.19,
+    "Ana": 136505908.03
+  },
+  "canal_maior_volume": "Online",
+  "canal_maior_faturamento": "Online",
+  "outliers_iqr_count": 582,
+  "outliers_iqr_pct": 2.89,
+  "outliers_zscore_count": 225,
+  "iqr_range_min": -50984.66,
+  "iqr_range_max": 111374.19,
+  "carlos_cancelamentos": 1490,
+  "outros_cancelamentos_media": 1300.2,
+  "carlos_ratio": 1.15,
+  "maria_ticket_medio": 42885.88,
+  "outros_ticket_medio": 34898.31,
+  "maria_ratio_ticket": 1.23,
+  "notas_invalidas_count": 20,
+  "prazo_zero_count": 4,
+  "variantes_sao_paulo": {
+    "São Paulo": 4050,
+    "são paulo": 21,
+    "SAO PAULO": 16,
+    "Sao Paulo": 9,
+    "S. Paulo": 6,
+    "SP": 4
+  },
+  "sazonalidade": {
+    "Monitor LG": {
+      "peak_month": "Jan",
+      "peak_value": 24900111.33,
+      "avg_value": 12446622.51,
+      "ratio": 2.0
+    },
+    "Mouse Logitech": {
+      "peak_month": "Jun",
+      "peak_value": 14485523.39,
+      "avg_value": 10431070.52,
+      "ratio": 1.39
+    },
+    "Notebook Dell": {
+      "peak_month": "Jun",
+      "peak_value": 14811002.45,
+      "avg_value": 10130867.93,
+      "ratio": 1.46
+    },
+    "Teclado Mecânico": {
+      "peak_month": "Jun",
+      "peak_value": 15782245.18,
+      "avg_value": 9668611.54,
+      "ratio": 1.63
+    },
+    "iPhone 15": {
+      "peak_month": "Nov",
+      "peak_value": 32799473.93,
+      "avg_value": 12204155.32,
+      "ratio": 2.69
+    }
+  }
+}
